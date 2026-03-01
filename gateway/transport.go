@@ -80,13 +80,13 @@ type Transport struct {
 
 // DialStream opens a new multiplexed stream.
 func (t *Transport) DialStream() (*Stream, error) {
-	return &Stream{mux: t.mux.DialStream()}, nil
+	return &Stream{conn: t.mux.DialStream()}, nil
 }
 
 // AcceptStream accepts an incoming multiplexed stream.
 func (t *Transport) AcceptStream() (*Stream, error) {
 	s, err := t.mux.AcceptStream()
-	return &Stream{mux: s}, err
+	return &Stream{conn: s}, err
 }
 
 // Close closes the underlying connection.
@@ -96,15 +96,22 @@ func (t *Transport) Close() error {
 
 // A Stream provides a multiplexed stream for the Sia gateway protocol.
 type Stream struct {
-	mux *mux.Stream
+	conn net.Conn
+}
+
+// NewStream creates a Stream from any net.Conn. This allows transports
+// that provide their own multiplexing (e.g., WebTransport) to reuse
+// the gateway RPC encoding.
+func NewStream(conn net.Conn) *Stream {
+	return &Stream{conn: conn}
 }
 
 func (s *Stream) withEncoder(fn func(*types.Encoder)) error {
-	return withV2Encoder(s.mux, fn)
+	return withV2Encoder(s.conn, fn)
 }
 
 func (s *Stream) withDecoder(maxLen int, fn func(*types.Decoder)) error {
-	return withV2Decoder(s.mux, maxLen, fn)
+	return withV2Decoder(s.conn, maxLen, fn)
 }
 
 // WriteID writes the RPC ID of r to the stream.
@@ -147,56 +154,93 @@ func (s *Stream) ReadResponse(r Object) error {
 
 // SetDeadline implements net.Conn.
 func (s *Stream) SetDeadline(t time.Time) error {
-	return s.mux.SetDeadline(t)
+	return s.conn.SetDeadline(t)
 }
 
 // Close closes the stream.
 func (s *Stream) Close() error {
-	return s.mux.Close()
+	return s.conn.Close()
 }
 
-// Dial initiates the gateway handshake with a peer.
-func Dial(conn net.Conn, ourHeader Header) (*Transport, error) {
-	p := &Transport{}
+// PeerInfo contains peer metadata exchanged during a gateway handshake.
+type PeerInfo struct {
+	Version  string
+	Addr     string
+	UniqueID UniqueID
+}
 
-	// exchange versions
+// DialHandshake performs the initiator side of the gateway handshake protocol
+// without establishing a multiplexer. This is useful for transports that
+// provide their own multiplexing (e.g., WebTransport).
+func DialHandshake(conn net.Conn, ourHeader Header) (PeerInfo, error) {
+	var info PeerInfo
 	const ourVersion = "2.0.0"
 	if err := withV1Encoder(conn, func(e *types.Encoder) { e.WriteString(ourVersion) }); err != nil {
-		return nil, fmt.Errorf("could not write our version: %w", err)
-	} else if err := withV1Decoder(conn, 128, func(d *types.Decoder) { p.Version = d.ReadString() }); err != nil {
-		return nil, fmt.Errorf("could not read peer version: %w", err)
+		return info, fmt.Errorf("could not write our version: %w", err)
+	} else if err := withV1Decoder(conn, 128, func(d *types.Decoder) { info.Version = d.ReadString() }); err != nil {
+		return info, fmt.Errorf("could not read peer version: %w", err)
 	}
-	// exchange headers
 	if err := writeHeader(conn, ourHeader); err != nil {
-		return nil, fmt.Errorf("could not write our header: %w", err)
-	} else if err := readHeader(conn, ourHeader, &p.Addr, &p.UniqueID); err != nil {
-		return nil, fmt.Errorf("could not read peer's header: %w", err)
+		return info, fmt.Errorf("could not write our header: %w", err)
+	} else if err := readHeader(conn, ourHeader, &info.Addr, &info.UniqueID); err != nil {
+		return info, fmt.Errorf("could not read peer's header: %w", err)
 	}
-	// establish mux
-	var err error
-	p.mux, err = mux.DialAnonymous(conn)
-	return p, err
+	return info, nil
 }
 
-// Accept reciprocates the gateway handshake with a peer.
-func Accept(conn net.Conn, ourHeader Header) (*Transport, error) {
-	p := &Transport{}
-
-	// exchange versions
+// AcceptHandshake performs the responder side of the gateway handshake protocol
+// without establishing a multiplexer. This is useful for transports that
+// provide their own multiplexing (e.g., WebTransport).
+func AcceptHandshake(conn net.Conn, ourHeader Header) (PeerInfo, error) {
+	var info PeerInfo
 	const ourVersion = "2.0.0"
-	if err := withV1Decoder(conn, 128, func(d *types.Decoder) { p.Version = d.ReadString() }); err != nil {
-		return nil, fmt.Errorf("could not read peer version: %w", err)
+	if err := withV1Decoder(conn, 128, func(d *types.Decoder) { info.Version = d.ReadString() }); err != nil {
+		return info, fmt.Errorf("could not read peer version: %w", err)
 	} else if err := withV1Encoder(conn, func(e *types.Encoder) { e.WriteString(ourVersion) }); err != nil {
-		return nil, fmt.Errorf("could not write our version: %w", err)
+		return info, fmt.Errorf("could not write our version: %w", err)
 	}
-	// exchange headers
-	if err := readHeader(conn, ourHeader, &p.Addr, &p.UniqueID); err != nil {
-		return nil, fmt.Errorf("could not read peer's header: %w", err)
+	if err := readHeader(conn, ourHeader, &info.Addr, &info.UniqueID); err != nil {
+		return info, fmt.Errorf("could not read peer's header: %w", err)
 	} else if err := writeHeader(conn, ourHeader); err != nil {
-		return nil, fmt.Errorf("could not write our header: %w", err)
+		return info, fmt.Errorf("could not write our header: %w", err)
 	}
-	// establish mux
-	var err error
-	p.mux, err = mux.AcceptAnonymous(conn)
-	return p, err
+	return info, nil
+}
+
+// Dial initiates the gateway handshake with a peer and establishes a
+// multiplexed transport.
+func Dial(conn net.Conn, ourHeader Header) (*Transport, error) {
+	info, err := DialHandshake(conn, ourHeader)
+	if err != nil {
+		return nil, err
+	}
+	m, err := mux.DialAnonymous(conn)
+	if err != nil {
+		return nil, err
+	}
+	return &Transport{
+		UniqueID: info.UniqueID,
+		Version:  info.Version,
+		Addr:     info.Addr,
+		mux:      m,
+	}, nil
+}
+
+// Accept reciprocates the gateway handshake with a peer and establishes a
+// multiplexed transport.
+func Accept(conn net.Conn, ourHeader Header) (*Transport, error) {
+	info, err := AcceptHandshake(conn, ourHeader)
+	if err != nil {
+		return nil, err
+	}
+	m, err := mux.AcceptAnonymous(conn)
+	if err != nil {
+		return nil, err
+	}
+	return &Transport{
+		UniqueID: info.UniqueID,
+		Version:  info.Version,
+		Addr:     info.Addr,
+		mux:      m,
+	}, nil
 }
